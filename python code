@@ -1,0 +1,1337 @@
+# ============================================================
+# PHYSICS-BASED PULSE DETONATION ENGINE MODEL
+#
+# Based on:
+#
+# T. Endo and T. Fujiwara
+# "A Simplified Analysis on a Pulse Detonation Engine Model"
+# Trans. Japan Soc. Aero. Space Sci., Vol. 44, No. 146, 2002
+#
+# Cantera:
+#   - Initial thermodynamic properties
+#   - Burned-gas equilibrium properties
+#
+# SDToolbox:
+#   - Accurate numerical CJ detonation velocity
+#   - Equilibrium CJ state
+#
+# Endo-Fujiwara:
+#   - CJ state relations
+#   - von Neumann spike
+#   - Rarefaction wave
+#   - Exhaust state
+#   - Cycle timing
+#   - Wall-pressure history
+#   - Impulse density
+#   - Average thrust density
+#
+# IMPORTANT:
+# This is an analytical / reduced-order PDE model.
+# It is NOT full reactive-Euler CFD or a full ZND simulation.
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORT LIBRARIES
+# ============================================================
+
+import numpy as np
+import cantera as ct
+import matplotlib.pyplot as plt
+
+try:
+    from sdtoolbox.postshock import CJspeed, PostShock_eq
+except ImportError as exc:
+    raise ImportError(
+        "\nSDToolbox could not be imported.\n\n"
+        "Make sure the SDToolbox 'sdtoolbox' folder is installed "
+        "inside the Python environment used by VS Code.\n\n"
+        "Test it separately with:\n"
+        "    python -c \"from sdtoolbox.postshock import "
+        "CJspeed, PostShock_eq; print('SDToolbox OK')\"\n"
+    ) from exc
+
+
+# ============================================================
+# 2. USER INPUTS
+# ============================================================
+
+# -------------------------------
+# PDE tube geometry
+# -------------------------------
+
+L = 2.0                 # Tube length [m]
+D_tube = 0.10           # Tube diameter [m]
+
+
+# -------------------------------
+# Initial mixture conditions
+# -------------------------------
+
+T1 = 300.0              # Initial temperature [K]
+P1 = 101325.0           # Initial pressure [Pa]
+
+
+# -------------------------------
+# Ambient pressure
+# -------------------------------
+
+P_ambient = 101325.0    # [Pa]
+
+
+# -------------------------------
+# Filling time
+# -------------------------------
+
+tau_f = 0.002           # Filling time [s]
+
+
+# -------------------------------
+# Number of points in pressure
+# history
+# -------------------------------
+
+N = 3000
+
+
+# ============================================================
+# 3. PROPELLANT MIXTURE
+# ============================================================
+
+# Stoichiometric acetylene / oxygen:
+#
+#       2 C2H2 + 5 O2
+#
+# SDToolbox accepts this type of composition string.
+
+FUEL = "C2H2"
+OXIDIZER = "O2"
+
+fuel_moles = 2.0
+oxidizer_moles = 5.0
+
+MIXTURE = (
+    f"{FUEL}:{fuel_moles} "
+    f"{OXIDIZER}:{oxidizer_moles}"
+)
+
+# Cantera mechanism
+MECHANISM = "gri30.yaml"
+
+
+# ============================================================
+# 4. PROGRAM HEADER
+# ============================================================
+
+print()
+print("=" * 70)
+print("PHYSICS-BASED PULSE DETONATION ENGINE MODEL")
+print("Endo-Fujiwara + Cantera + SDToolbox")
+print("=" * 70)
+print()
+
+print("Loading Cantera mechanism...")
+print(f"Mechanism : {MECHANISM}")
+print(f"Mixture   : {MIXTURE}")
+print()
+
+
+# ============================================================
+# 5. CREATE CANTERA GAS
+# ============================================================
+
+gas = ct.Solution(MECHANISM)
+
+
+# ============================================================
+# 6. INITIAL UNBURNED STATE
+# ============================================================
+
+print("Calculating initial mixture properties...")
+
+gas.TPX = T1, P1, MIXTURE
+
+
+# Initial density
+rho1 = gas.density
+
+
+# Initial specific heats
+cp1 = gas.cp_mass
+cv1 = gas.cv_mass
+
+
+# Initial gamma
+gamma1 = cp1 / cv1
+
+
+# Initial speed of sound
+a1 = np.sqrt(
+    gamma1 * P1 / rho1
+)
+
+
+# Initial specific internal energy
+u1 = gas.int_energy_mass
+
+
+# Initial specific enthalpy
+h1 = gas.enthalpy_mass
+
+
+# Initial molecular weight
+MW1 = gas.mean_molecular_weight
+
+
+# Save initial composition
+Y_reactants = gas.Y.copy()
+
+
+# ============================================================
+# 7. DISPLAY INITIAL STATE
+# ============================================================
+
+print()
+print("-" * 70)
+print("INITIAL UNBURNED STATE")
+print("-" * 70)
+
+print(f"Mixture              : {MIXTURE}")
+print(f"T1                   : {T1:.3f} K")
+print(f"P1                   : {P1:.3f} Pa")
+print(f"rho1                 : {rho1:.6f} kg/m^3")
+print(f"cp1                  : {cp1:.3f} J/(kg K)")
+print(f"cv1                  : {cv1:.3f} J/(kg K)")
+print(f"gamma1               : {gamma1:.6f}")
+print(f"a1                   : {a1:.3f} m/s")
+print(f"u1                   : {u1:.3f} J/kg")
+print(f"h1                   : {h1:.3f} J/kg")
+print(f"MW1                  : {MW1:.3f} kg/kmol")
+
+
+# ============================================================
+# 8. ACCURATE CJ DETONATION VELOCITY
+#    USING SDTOOLBOX
+# ============================================================
+
+print()
+print("=" * 70)
+print("SDTOOLBOX CJ DETONATION CALCULATION")
+print("=" * 70)
+
+print()
+print("Calculating numerical CJ velocity...")
+print("This may take a few seconds.")
+
+
+try:
+
+    DCJ = CJspeed(
+        P1,
+        T1,
+        MIXTURE,
+        MECHANISM
+    )
+
+except Exception as exc:
+
+    raise RuntimeError(
+        "\nSDToolbox failed while calculating the CJ velocity.\n\n"
+        f"Pressure       : {P1} Pa\n"
+        f"Temperature    : {T1} K\n"
+        f"Mixture        : {MIXTURE}\n"
+        f"Mechanism      : {MECHANISM}\n\n"
+        "Original error:\n"
+        f"{exc}"
+    ) from exc
+
+
+# Check result
+if not np.isfinite(DCJ) or DCJ <= 0.0:
+
+    raise RuntimeError(
+        f"\nInvalid CJ velocity returned by SDToolbox: "
+        f"{DCJ}"
+    )
+
+
+# Initial Mach number of detonation wave
+MCJ = DCJ / a1
+
+
+print()
+print("-" * 70)
+print("NUMERICAL CJ RESULT")
+print("-" * 70)
+
+print(f"CJ velocity         : {DCJ:.6f} m/s")
+print(f"CJ Mach number      : {MCJ:.6f}")
+
+
+# ============================================================
+# 9. GET EQUILIBRIUM CJ STATE FROM SDTOOLBOX
+# ============================================================
+
+print()
+print("Calculating equilibrium CJ state...")
+
+
+try:
+
+    cj_gas = PostShock_eq(
+        DCJ,
+        P1,
+        T1,
+        MIXTURE,
+        MECHANISM
+    )
+
+except Exception as exc:
+
+    raise RuntimeError(
+        "\nSDToolbox failed while calculating the "
+        "equilibrium CJ state.\n\n"
+        f"Original error:\n{exc}"
+    ) from exc
+
+
+# ------------------------------------------------------------
+# CJ thermodynamic properties
+# ------------------------------------------------------------
+
+T_CJ_SD = cj_gas.T
+P_CJ_SD = cj_gas.P
+rho_CJ_SD = cj_gas.density
+
+cp_CJ_SD = cj_gas.cp_mass
+cv_CJ_SD = cj_gas.cv_mass
+
+gamma_CJ_SD = cp_CJ_SD / cv_CJ_SD
+
+MW_CJ_SD = cj_gas.mean_molecular_weight
+
+a_CJ_SD = np.sqrt(
+    gamma_CJ_SD * P_CJ_SD / rho_CJ_SD
+)
+
+
+# ============================================================
+# 10. DISPLAY SDTOOLBOX CJ STATE
+# ============================================================
+
+print()
+print("-" * 70)
+print("SDTOOLBOX EQUILIBRIUM CJ STATE")
+print("-" * 70)
+
+print(f"CJ temperature      : {T_CJ_SD:.3f} K")
+print(f"CJ pressure         : {P_CJ_SD:.6e} Pa")
+print(f"CJ pressure         : {P_CJ_SD / 1e5:.3f} bar")
+print(f"CJ density          : {rho_CJ_SD:.6f} kg/m^3")
+print(f"CJ gamma            : {gamma_CJ_SD:.6f}")
+print(f"CJ cp               : {cp_CJ_SD:.3f} J/(kg K)")
+print(f"CJ cv               : {cv_CJ_SD:.3f} J/(kg K)")
+print(f"CJ molecular weight : {MW_CJ_SD:.3f} kg/kmol")
+print(f"CJ sound speed      : {a_CJ_SD:.3f} m/s")
+
+
+# ============================================================
+# 11. USE CJ GAMMA FROM SDTOOLBOX
+# ============================================================
+#
+# The original Endo-Fujiwara equations require gamma2.
+#
+# We therefore use the equilibrium CJ gamma obtained from
+# SDToolbox instead of calculating an approximate DCJ from
+# Cantera heat release.
+#
+# This creates a hybrid model:
+#
+#   SDToolbox -> accurate numerical CJ velocity
+#   SDToolbox -> equilibrium CJ gamma
+#   Endo-Fujiwara -> reduced-order PDE wave/cycle model
+#
+# ============================================================
+
+gamma2 = gamma_CJ_SD
+
+
+# ============================================================
+# 12. CJ DETONATION STATE
+# ============================================================
+#
+# Endo-Fujiwara equations:
+#
+# rho2 =
+#
+#       (gamma2 + 1)/gamma2 * rho1
+#
+#
+# p2 =
+#
+#       gamma1/(gamma2 + 1) * MCJ^2 * P1
+#
+#
+# u2 =
+#
+#       DCJ/gamma2
+#
+#
+# a2 =
+#
+#       DCJ/(gamma2 + 1)
+#
+# ============================================================
+
+rho2 = (
+    (gamma2 + 1.0)
+    / gamma2
+    * rho1
+)
+
+
+p2 = (
+    gamma1
+    / (gamma2 + 1.0)
+    * MCJ**2
+    * P1
+)
+
+
+u2 = (
+    DCJ
+    / gamma2
+)
+
+
+a2 = (
+    DCJ
+    / (gamma2 + 1.0)
+)
+
+
+# ============================================================
+# 13. VON NEUMANN SPIKE
+# ============================================================
+#
+# rhoN =
+#
+#       (gamma1 + 1)/(gamma1 - 1) * rho1
+#
+#
+# pN =
+#
+#       2 gamma1/(gamma1 + 1) * MCJ^2 * P1
+#
+# ============================================================
+
+rhoN = (
+    (gamma1 + 1.0)
+    / (gamma1 - 1.0)
+    * rho1
+)
+
+
+pN = (
+    2.0
+    * gamma1
+    / (gamma1 + 1.0)
+    * MCJ**2
+    * P1
+)
+
+
+# ============================================================
+# 14. REAR BOUNDARY OF RAREFACTION WAVE
+# ============================================================
+#
+# Endo-Fujiwara:
+#
+# rho3 =
+#
+# 2 [ (gamma2 + 1)/(2 gamma2) ]
+# ^[(gamma2 + 1)/(gamma2 - 1)]
+# rho1
+#
+#
+# p3 =
+#
+# gamma1/(2 gamma2)
+# [ (gamma2 + 1)/(2 gamma2) ]
+# ^[2 gamma2/(gamma2 - 1)]
+# MCJ^2 P1
+#
+#
+# u3 = 0
+#
+# a3 = DCJ/2
+#
+# ============================================================
+
+rho3 = (
+    2.0
+    * (
+        (gamma2 + 1.0)
+        / (2.0 * gamma2)
+    )
+    ** (
+        (gamma2 + 1.0)
+        / (gamma2 - 1.0)
+    )
+    * rho1
+)
+
+
+p3 = (
+    gamma1
+    / (2.0 * gamma2)
+    * (
+        (gamma2 + 1.0)
+        / (2.0 * gamma2)
+    )
+    ** (
+        2.0 * gamma2
+        / (gamma2 - 1.0)
+    )
+    * MCJ**2
+    * P1
+)
+
+
+u3 = 0.0
+
+a3 = DCJ / 2.0
+
+
+# ============================================================
+# 15. EXHAUST RAREFACTION STATE
+# ============================================================
+#
+# rho_ex =
+#
+# rho3 [2/(gamma2+1)]^[2/(gamma2-1)]
+#
+#
+# p_ex =
+#
+# p3 [2/(gamma2+1)]
+# ^[2 gamma2/(gamma2-1)]
+#
+#
+# u_ex = a_ex =
+#
+# DCJ/(gamma2+1)
+#
+# ============================================================
+
+rho_ex = (
+    rho3
+    * (
+        2.0
+        / (gamma2 + 1.0)
+    )
+    ** (
+        2.0
+        / (gamma2 - 1.0)
+    )
+)
+
+
+p_ex = (
+    p3
+    * (
+        2.0
+        / (gamma2 + 1.0)
+    )
+    ** (
+        2.0 * gamma2
+        / (gamma2 - 1.0)
+    )
+)
+
+
+u_ex = (
+    DCJ
+    / (gamma2 + 1.0)
+)
+
+
+a_ex = u_ex
+
+
+# ============================================================
+# 16. PDE PHASE TIMING
+# ============================================================
+#
+# From Endo-Fujiwara:
+#
+# tI = 2L/DCJ
+#
+# tII = 4L/DCJ
+#
+# tIII - tI =
+#
+# rho3 L/(rho_ex u_ex)
+#
+# ============================================================
+
+tI = (
+    2.0
+    * L
+    / DCJ
+)
+
+
+tII = (
+    4.0
+    * L
+    / DCJ
+)
+
+
+t_exhaust = (
+    rho3
+    * L
+    / (
+        rho_ex
+        * u_ex
+    )
+)
+
+
+tIII = (
+    tI
+    + t_exhaust
+)
+
+
+Tcyc = (
+    tIII
+    + tau_f
+)
+
+
+fcyc = (
+    1.0
+    / Tcyc
+)
+
+
+# ============================================================
+# 17. PRINT GAS-DYNAMIC RESULTS
+# ============================================================
+
+print()
+print("=" * 70)
+print("PDE GAS-DYNAMIC RESULTS")
+print("=" * 70)
+
+print()
+print("CJ STATE")
+print("-" * 70)
+
+print(f"rho2                 : {rho2:.6f} kg/m^3")
+print(f"p2                   : {p2:.6e} Pa")
+print(f"p2                   : {p2 / 1e5:.3f} bar")
+print(f"u2                   : {u2:.3f} m/s")
+print(f"a2                   : {a2:.3f} m/s")
+
+
+print()
+print("VON NEUMANN SPIKE")
+print("-" * 70)
+
+print(f"rhoN                 : {rhoN:.6f} kg/m^3")
+print(f"pN                   : {pN:.6e} Pa")
+print(f"pN                   : {pN / 1e5:.3f} bar")
+
+
+print()
+print("REGION 3")
+print("-" * 70)
+
+print(f"rho3                 : {rho3:.6f} kg/m^3")
+print(f"p3                   : {p3:.6e} Pa")
+print(f"p3                   : {p3 / 1e5:.3f} bar")
+print(f"u3                   : {u3:.3f} m/s")
+print(f"a3                   : {a3:.3f} m/s")
+
+
+print()
+print("EXHAUST STATE")
+print("-" * 70)
+
+print(f"rho_ex               : {rho_ex:.6f} kg/m^3")
+print(f"p_ex                 : {p_ex:.6e} Pa")
+print(f"p_ex                 : {p_ex / 1e5:.3f} bar")
+print(f"u_ex                 : {u_ex:.3f} m/s")
+print(f"a_ex                 : {a_ex:.3f} m/s")
+
+
+print()
+print("PDE TIMING")
+print("-" * 70)
+
+print(f"tI                   : {tI * 1000:.6f} ms")
+print(f"tII                  : {tII * 1000:.6f} ms")
+print(f"tIII                 : {tIII * 1000:.6f} ms")
+print(f"Exhaust duration     : {t_exhaust * 1000:.6f} ms")
+print(f"Filling time         : {tau_f * 1000:.6f} ms")
+print(f"Cycle time           : {Tcyc * 1000:.6f} ms")
+print(f"Cycle frequency      : {fcyc:.6f} Hz")
+
+
+# ============================================================
+# 18. EXHAUST VALIDITY CHECK
+# ============================================================
+
+print()
+print("-" * 70)
+print("EXHAUST VALIDITY CHECK")
+print("-" * 70)
+
+print(f"p_ex                 : {p_ex:.6e} Pa")
+print(f"P_ambient            : {P_ambient:.6e} Pa")
+
+
+if p_ex < P_ambient:
+
+    print()
+    print("WARNING:")
+    print(
+        "The calculated exhaust pressure is below ambient."
+    )
+    print(
+        "The Endo-Fujiwara exhaust approximation is therefore "
+        "outside its stated validity for this condition."
+    )
+
+else:
+
+    print()
+    print(
+        "p_ex >= P_ambient -> "
+        "acceptable for the paper's approximation."
+    )
+
+
+# ============================================================
+# 19. TUBE CROSS-SECTION
+# ============================================================
+
+A_tube = (
+    np.pi
+    * D_tube**2
+    / 4.0
+)
+
+
+# ============================================================
+# 20. WALL PRESSURE HISTORY
+# ============================================================
+#
+# Paper's simplified model:
+#
+# Phase I / combustion:
+#       p_w = p3
+#
+# Phase II / early exhaust:
+#       p_w = p3
+#
+# Phase III:
+#       p_w decreases linearly to zero
+#
+# Filling:
+#       p_w = 0
+#
+# ============================================================
+
+time = np.linspace(
+    0.0,
+    Tcyc,
+    N
+)
+
+
+pressure = np.zeros_like(time)
+
+
+# ------------------------------------------------------------
+# Constant-pressure portion
+# ------------------------------------------------------------
+
+mask_constant = (
+    (time >= 0.0)
+    &
+    (time <= tII)
+)
+
+pressure[mask_constant] = p3
+
+
+# ------------------------------------------------------------
+# Linear pressure-decay portion
+# ------------------------------------------------------------
+
+mask_decay = (
+    (time > tII)
+    &
+    (time <= tIII)
+)
+
+pressure[mask_decay] = (
+    p3
+    * (
+        1.0
+        -
+        (
+            time[mask_decay]
+            - tII
+        )
+        /
+        (
+            tIII
+            - tII
+        )
+    )
+)
+
+
+# ------------------------------------------------------------
+# Filling phase
+# ------------------------------------------------------------
+
+mask_filling = (
+    time > tIII
+)
+
+pressure[mask_filling] = 0.0
+
+
+# ============================================================
+# 21. IMPULSE DENSITY - NUMERICAL
+# ============================================================
+
+# Compatibility with different NumPy versions
+
+if hasattr(np, "trapezoid"):
+
+    Icyc_numerical = np.trapezoid(
+        pressure,
+        time
+    )
+
+else:
+
+    Icyc_numerical = np.trapz(
+        pressure,
+        time
+    )
+
+
+# ============================================================
+# 22. IMPULSE DENSITY - ANALYTICAL
+# ============================================================
+#
+# Endo-Fujiwara equation:
+#
+# Icyc =
+#
+# 1/(2 gamma2)
+#
+# [ (gamma2+1)/(2 gamma2) ]
+# ^[(gamma2+1)/(gamma2-1)]
+#
+# *
+#
+# [
+#   3 +
+#   ((gamma2+1)/2)
+#   ^[(gamma2+1)/(gamma2-1)]
+# ]
+#
+# *
+#
+# rho1 DCJ L
+#
+# ============================================================
+
+Icyc_analytical = (
+    1.0
+    / (
+        2.0
+        * gamma2
+    )
+    *
+    (
+        (gamma2 + 1.0)
+        /
+        (2.0 * gamma2)
+    )
+    ** (
+        (gamma2 + 1.0)
+        /
+        (gamma2 - 1.0)
+    )
+    *
+    (
+        3.0
+        +
+        (
+            (gamma2 + 1.0)
+            / 2.0
+        )
+        ** (
+            (gamma2 + 1.0)
+            /
+            (gamma2 - 1.0)
+        )
+    )
+    *
+    rho1
+    * DCJ
+    * L
+)
+
+
+# ============================================================
+# 23. AVERAGE THRUST DENSITY
+# ============================================================
+
+pav_numerical = (
+    Icyc_numerical
+    / Tcyc
+)
+
+
+pav_analytical = (
+    Icyc_analytical
+    / Tcyc
+)
+
+
+# ============================================================
+# 24. AVERAGE THRUST
+# ============================================================
+#
+# F_average = average pressure * tube area
+#
+# This is the simplified thrust estimate used by the
+# reduced-order Endo-Fujiwara model.
+#
+# ============================================================
+
+F_average = (
+    pav_numerical
+    * A_tube
+)
+
+
+F_average_analytical = (
+    pav_analytical
+    * A_tube
+)
+
+
+# ============================================================
+# 25. IMPULSE ERROR
+# ============================================================
+
+if abs(Icyc_analytical) > 0.0:
+
+    impulse_error = (
+        abs(
+            Icyc_numerical
+            - Icyc_analytical
+        )
+        /
+        abs(Icyc_analytical)
+        * 100.0
+    )
+
+else:
+
+    impulse_error = np.nan
+
+
+# ============================================================
+# 26. PERFORMANCE RESULTS
+# ============================================================
+
+print()
+print("=" * 70)
+print("PDE PERFORMANCE")
+print("=" * 70)
+
+
+print()
+print("GEOMETRY")
+print("-" * 70)
+
+print(f"Tube diameter        : {D_tube:.6f} m")
+print(f"Tube length          : {L:.6f} m")
+print(f"Tube area            : {A_tube:.6f} m^2")
+
+
+print()
+print("IMPULSE DENSITY")
+print("-" * 70)
+
+print(
+    f"Numerical            : "
+    f"{Icyc_numerical:.6f} N*s/m^2"
+)
+
+print(
+    f"Analytical           : "
+    f"{Icyc_analytical:.6f} N*s/m^2"
+)
+
+
+print()
+print("AVERAGE THRUST DENSITY")
+print("-" * 70)
+
+print(
+    f"Numerical            : "
+    f"{pav_numerical:.6e} Pa"
+)
+
+print(
+    f"Analytical           : "
+    f"{pav_analytical:.6e} Pa"
+)
+
+
+print()
+print("AVERAGE THRUST")
+print("-" * 70)
+
+print(
+    f"Numerical            : "
+    f"{F_average:.6f} N"
+)
+
+print(
+    f"Analytical           : "
+    f"{F_average_analytical:.6f} N"
+)
+
+
+print()
+print("IMPULSE COMPARISON")
+print("-" * 70)
+
+print(
+    f"Numerical/analytical error : "
+    f"{impulse_error:.6f} %"
+)
+
+
+# ============================================================
+# 27. PAPER'S GAMMA = 1.4 APPROXIMATION
+# ============================================================
+#
+# The paper gives approximately:
+#
+# Icyc ~= 0.85 rho1 DCJ L
+#
+# and:
+#
+# pav ~= 0.85 rho1 DCJ L
+#        ----------------
+#        8L/DCJ + tau_f
+#
+# ============================================================
+
+Icyc_gamma14 = (
+    0.85
+    * rho1
+    * DCJ
+    * L
+)
+
+
+pav_gamma14 = (
+    Icyc_gamma14
+    /
+    (
+        8.0
+        * L
+        / DCJ
+        +
+        tau_f
+    )
+)
+
+
+print()
+print("-" * 70)
+print("GAMMA = 1.4 APPROXIMATION FROM PAPER")
+print("-" * 70)
+
+print(
+    f"Icyc approx          : "
+    f"{Icyc_gamma14:.6f} N*s/m^2"
+)
+
+print(
+    f"pav approx           : "
+    f"{pav_gamma14:.6e} Pa"
+)
+
+
+# ============================================================
+# 28. RESULTS DICTIONARY
+# ============================================================
+
+results = {
+
+    # --------------------------------------------------------
+    # Initial state
+    # --------------------------------------------------------
+
+    "T1_K": T1,
+    "P1_Pa": P1,
+    "rho1_kg_m3": rho1,
+    "gamma1": gamma1,
+    "a1_m_s": a1,
+
+    # --------------------------------------------------------
+    # SDToolbox CJ result
+    # --------------------------------------------------------
+
+    "DCJ_SDToolbox_m_s": DCJ,
+    "MCJ": MCJ,
+
+    "T_CJ_SDToolbox_K": T_CJ_SD,
+    "P_CJ_SDToolbox_Pa": P_CJ_SD,
+    "rho_CJ_SDToolbox_kg_m3": rho_CJ_SD,
+    "gamma_CJ_SDToolbox": gamma_CJ_SD,
+    "a_CJ_SDToolbox_m_s": a_CJ_SD,
+
+    # --------------------------------------------------------
+    # Endo-Fujiwara CJ state
+    # --------------------------------------------------------
+
+    "gamma2": gamma2,
+    "rho2_kg_m3": rho2,
+    "p2_Pa": p2,
+    "u2_m_s": u2,
+    "a2_m_s": a2,
+
+    # --------------------------------------------------------
+    # Von Neumann
+    # --------------------------------------------------------
+
+    "rhoN_kg_m3": rhoN,
+    "pN_Pa": pN,
+
+    # --------------------------------------------------------
+    # Region 3
+    # --------------------------------------------------------
+
+    "rho3_kg_m3": rho3,
+    "p3_Pa": p3,
+    "u3_m_s": u3,
+    "a3_m_s": a3,
+
+    # --------------------------------------------------------
+    # Exhaust
+    # --------------------------------------------------------
+
+    "rho_ex_kg_m3": rho_ex,
+    "p_ex_Pa": p_ex,
+    "u_ex_m_s": u_ex,
+
+    # --------------------------------------------------------
+    # Timing
+    # --------------------------------------------------------
+
+    "tI_s": tI,
+    "tII_s": tII,
+    "tIII_s": tIII,
+    "Tcyc_s": Tcyc,
+    "frequency_Hz": fcyc,
+
+    # --------------------------------------------------------
+    # Performance
+    # --------------------------------------------------------
+
+    "Icyc_numerical_Ns_m2": Icyc_numerical,
+    "Icyc_analytical_Ns_m2": Icyc_analytical,
+
+    "pav_numerical_Pa": pav_numerical,
+    "pav_analytical_Pa": pav_analytical,
+
+    "F_average_N": F_average,
+    "F_average_analytical_N": F_average_analytical,
+
+    "impulse_error_percent": impulse_error,
+}
+
+
+# ============================================================
+# 29. FINAL SUMMARY
+# ============================================================
+
+print()
+print("=" * 70)
+print("FINAL SUMMARY")
+print("=" * 70)
+
+print()
+print(f"Mixture             = {MIXTURE}")
+print(f"Initial temperature = {T1:.2f} K")
+print(f"Initial pressure    = {P1 / 1e5:.3f} bar")
+
+print()
+print(f"gamma1              = {gamma1:.4f}")
+print(f"CJ gamma            = {gamma2:.4f}")
+
+print()
+print(
+    f"CJ velocity         = "
+    f"{DCJ:.2f} m/s"
+)
+
+print(
+    f"CJ Mach number      = "
+    f"{MCJ:.2f}"
+)
+
+print(
+    f"SDToolbox CJ pressure = "
+    f"{P_CJ_SD / 1e5:.2f} bar"
+)
+
+print(
+    f"Endo-Fujiwara p2    = "
+    f"{p2 / 1e5:.2f} bar"
+)
+
+print(
+    f"Von Neumann pressure= "
+    f"{pN / 1e5:.2f} bar"
+)
+
+print(
+    f"Region-3 pressure   = "
+    f"{p3 / 1e5:.2f} bar"
+)
+
+print(
+    f"Exhaust pressure    = "
+    f"{p_ex / 1e5:.2f} bar"
+)
+
+print(
+    f"Cycle frequency     = "
+    f"{fcyc:.2f} Hz"
+)
+
+print(
+    f"Average thrust      = "
+    f"{F_average:.2f} N"
+)
+
+
+# ============================================================
+# 30. PRESSURE HISTORY PLOT
+# ============================================================
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    time * 1000.0,
+    pressure / 1e5,
+    linewidth=2.0
+)
+
+plt.xlabel("Time [ms]")
+plt.ylabel("Wall Pressure [bar]")
+
+plt.title(
+    "Pulse Detonation Engine Wall Pressure History"
+)
+
+plt.grid(True)
+
+plt.axvline(
+    tI * 1000.0,
+    linestyle="--",
+    label="tI"
+)
+
+plt.axvline(
+    tII * 1000.0,
+    linestyle="--",
+    label="tII"
+)
+
+plt.axvline(
+    tIII * 1000.0,
+    linestyle="--",
+    label="tIII"
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# 31. SECOND PLOT - PRESSURE CYCLE
+# ============================================================
+
+plt.figure(figsize=(10, 5))
+
+plt.plot(
+    time * 1000.0,
+    pressure / 1e5,
+    linewidth=2.0
+)
+
+plt.xlabel("Time [ms]")
+plt.ylabel("Pressure [bar]")
+
+plt.title(
+    "Endo-Fujiwara Simplified PDE Cycle"
+)
+
+plt.grid(True)
+
+plt.text(
+    tI * 1000.0,
+    p3 / 1e5,
+    "  tI"
+)
+
+plt.text(
+    tII * 1000.0,
+    p3 / 1e5,
+    "  tII"
+)
+
+plt.text(
+    tIII * 1000.0,
+    p3 / 1e5,
+    "  tIII"
+)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# 32. MODEL COMPLETE
+# ============================================================
+
+print()
+print("=" * 70)
+print("MODEL COMPLETE")
+print("=" * 70)
+print()
